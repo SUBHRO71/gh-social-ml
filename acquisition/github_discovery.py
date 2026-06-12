@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import itertools
+import logging
 import random
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from .github_client import GitHubClient
+
+logger = logging.getLogger(__name__)
 
 
 DISCOVERY_CATEGORIES: dict[str, list[str]] = {
@@ -80,7 +83,7 @@ class GitHubDiscoveryEngine:
                         max_pages=self.config.pages_per_query,
                     )
                 except Exception as exc:
-                    logger.warning("Discovery query failed for %s/%s: %s", category, band, exc)
+                    print(f"[WARN] Discovery query failed for {category}/{band}: {exc}")
                     continue
                 for repo in repos:
                     full_name = repo.get("full_name")

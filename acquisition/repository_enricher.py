@@ -8,7 +8,7 @@ from typing import Any
 import logging
 
 from .github_graphql_client import GitHubGraphQLClient
-from utils.readme_processor import ReadmeDocument, process_readme_payload
+from utils.readme_processor import ReadmeDocument, process_readme_payload, process_markdown
 
 logger = logging.getLogger(__name__)
 
@@ -190,10 +190,8 @@ class RepositoryEnricher:
                 "created_at": commit.get("committedDate")
             })
 
-        # Contributors / mentionable users
-        contributors = data.get("mentionableUsers", {}).get("nodes", [])
-        if not contributors:
-            contributors = []
+        # Contributor data is not required downstream; returning an empty list as audited.
+        contributors = []
 
         # Construct raw_repository (REST equivalent structure for downstream compatibility)
         raw_repository = {

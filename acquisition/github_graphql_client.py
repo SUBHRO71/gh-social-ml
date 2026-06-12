@@ -7,11 +7,14 @@ import random
 import time
 from datetime import datetime, timezone
 from typing import Any
+import logging
 
 import requests
 
 from .graphql_queries import GET_README_QUERY, GET_REPOSITORY_QUERY, build_batch_metadata_query
 from .github_client import GitHubClientError, GitHubRateLimit
+
+logger = logging.getLogger(__name__)
 
 
 class GitHubGraphQLClient:
@@ -54,14 +57,25 @@ class GitHubGraphQLClient:
         try:
             response = self.execute(GET_README_QUERY, {"owner": owner, "name": name})
             if not response:
+                logger.info(f"README not found for {owner}/{name}: Repository could not be resolved.")
                 return ""
-            repo = (response.get("data") or {}).get("repository") or {}
+            repo = (response.get("data") or {}).get("repository")
+            if repo is None:
+                logger.info(f"README not found for {owner}/{name}: Repository data is null.")
+                return ""
+            has_readme_keys = False
             for key in ["readme1", "readme2", "readme3", "readme4", "readme5"]:
                 blob = repo.get(key)
-                if blob and blob.get("text"):
-                    return blob["text"]
-        except Exception:
-            pass
+                if blob is not None:
+                    has_readme_keys = True
+                    if blob.get("text"):
+                        return blob["text"]
+            if has_readme_keys:
+                logger.info(f"README not found for {owner}/{name}: All README blobs are empty or null.")
+            else:
+                logger.info(f"README not found for {owner}/{name}: No README fields returned.")
+        except Exception as exc:
+            logger.warning(f"README fetch failed for {owner}/{name}: {exc}", exc_info=True)
         return ""
 
     def get_repositories_batch(self, repos: list[tuple[str, str]]) -> dict[str, dict[str, Any]]:
@@ -125,10 +139,11 @@ class GitHubGraphQLClient:
                 logger.debug("GraphQL rate limit: %s remaining", rl.get("remaining"))
             
             if "errors" in result:
-                # Some errors are partial, e.g., missing repository
-                # We check if there's actual data returned
-                if not result.get("data"):
+                if result.get("data"):
+                    logger.warning(f"GitHub GraphQL returned partial errors: {result['errors']}")
+                else:
                     if any("Could not resolve to a Repository" in e.get("message", "") for e in result["errors"]):
+                        logger.warning(f"GitHub GraphQL could not resolve repository: {result['errors']}")
                         return None
                     raise GitHubClientError(f"GitHub GraphQL returned errors: {result['errors']}")
 
