@@ -4,5 +4,6 @@ requests
 numpy
 sentence-transformers
 qdrant-client
+pg8000
 
 # docker in your system
