@@ -8,7 +8,7 @@ import os
 
 from dotenv import load_dotenv
 
-from embedding.config import QDRANT_API_KEY, QDRANT_COLLECTION_NAME, QDRANT_URL
+from config import QDRANT_API_KEY, QDRANT_COLLECTION_NAME, QDRANT_URL
 from embedding.embedding_pipeline import RepositoryEmbeddingPipeline
 from embedding.qdrant_store import QdrantRepositoryStore
 from embedding.repository_embedding import RepositoryEmbeddingConfig

@@ -196,7 +196,7 @@ def index_approved_repositories(
         logger.warning("Skipping Qdrant indexing because no repositories passed the filter.")
         return []
 
-    from embedding.config import QDRANT_API_KEY, QDRANT_COLLECTION_NAME, QDRANT_URL
+    from config import QDRANT_API_KEY, QDRANT_COLLECTION_NAME, QDRANT_URL
     from embedding.embedding_pipeline import RepositoryEmbeddingPipeline
     from embedding.qdrant_store import QdrantRepositoryStore
     from embedding.repository_embedding import RepositoryEmbeddingConfig

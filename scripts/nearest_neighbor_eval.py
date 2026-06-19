@@ -14,7 +14,7 @@ from typing import Any
 
 from dotenv import load_dotenv
 
-from embedding.config import (
+from config import (
     QDRANT_API_KEY,
     QDRANT_COLLECTION_NAME,
     QDRANT_DISTANCE,

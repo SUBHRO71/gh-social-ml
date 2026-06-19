@@ -7,7 +7,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
-from .config import (
+from config import (
     README_CHUNK_CHARS,
     README_CHUNK_OVERLAP_CHARS,
     REPO_TOWER_WEIGHTS,

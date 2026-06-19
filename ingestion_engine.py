@@ -7,7 +7,7 @@ from ingestion.classification import classify_category
 from ingestion.corpus import CorpusStore, dynamic_cluster_discovery
 from ingestion.result import IngestionResult, NoveltyMatrix
 
-import embedding.config as config
+import config as config
 
 if __name__ == "__main__":
     target_data_json_path = "/mnt/user-data/uploads/staged_repositories.json"
