@@ -150,3 +150,33 @@ def test_end_to_end_retrieval(retriever, mock_db_connector):
     assert candidates[1]["retrieval_source"] == "trending"
     assert candidates[1]["star_count"] == 100
     assert "repo_embedding" in candidates[1]
+
+def test_semantic_failure_reallocates_quota(retriever, mock_db_connector):
+    db, cursor = mock_db_connector
+    mock_store = retriever._qdrant_store
+    
+    # Mock semantic search returns empty list (representing failure or Qdrant down)
+    mock_store.search.return_value = []
+    
+    # Mock Trending returns up to full pool (e.g., mock 2 trending items)
+    cursor.fetchall.side_effect = [
+        # Call 1: Trending search
+        [("repo-1", "org/repo1", 500), ("repo-2", "org/repo2", 400)],
+        # Call 2: Metadata hydration
+        [("repo-1", "url", "owner", "name", "org/repo1", "desc", "lang", "[]", "[]", "readme", 500, 10, 5, 20, 0, 0, 0, None, None),
+         ("repo-2", "url", "owner", "name", "org/repo2", "desc", "lang", "[]", "[]", "readme", 400, 10, 5, 20, 0, 0, 0, None, None)]
+    ]
+    
+    # Mock Embedding hydration returns empty to fallback to zero-vectors
+    mock_store.client.retrieve.return_value = []
+    
+    with patch.object(retriever, '_retrieve_trending', wraps=retriever._retrieve_trending) as spy_trending:
+        candidates = retriever.retrieve_candidates(user_embedding=[0.1] * EMBEDDING_DIM)
+        
+        # Verify that trending retrieval was called with TOTAL_CANDIDATE_POOL (150)
+        # since semantic search returned 0 candidates.
+        spy_trending.assert_called_once_with(TOTAL_CANDIDATE_POOL)
+        
+    assert len(candidates) == 2
+    assert candidates[0]["repo_id"] == "repo-1"
+    assert candidates[0]["retrieval_source"] == "trending"

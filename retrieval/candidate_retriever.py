@@ -148,17 +148,28 @@ class CandidateRetriever:
                 )
                 user_interests = None
 
-        # ── Determine channel quotas ─────────────────────────────────────
+        # ── Determine initial semantic quota ─────────────────────────────
         semantic_quota = SEMANTIC_LIMIT if user_embedding is not None else 0
-        trending_quota = min(TOTAL_CANDIDATE_POOL - semantic_quota, TRENDING_LIMIT)
-
-        logger.info(
-            "Retrieval quotas — Semantic: %d, Trending: %d (total target: %d)",
-            semantic_quota, trending_quota, TOTAL_CANDIDATE_POOL,
-        )
 
         # ── Channel 1: Semantic retrieval (Qdrant) ───────────────────────
         semantic_ids = self._retrieve_semantic(user_embedding, semantic_quota)
+
+        # ── Determine trending quota ─────────────────────────────────────
+        # If semantic channel was expected to run but returned fewer results than semantic_quota
+        # (e.g. Qdrant is down, or failed, or matched fewer items), reallocate the unused
+        # semantic quota to trending to backfill/fill the pool.
+        # Otherwise, if semantic retrieval was explicitly disabled (user_embedding is None),
+        # cap the trending quota at TRENDING_LIMIT to avoid fetching too many rows.
+        if user_embedding is not None:
+            unique_semantic = len({c.get("full_name") or c.get("repo_id") for c in semantic_ids if c.get("full_name") or c.get("repo_id")})
+            trending_quota = max(TOTAL_CANDIDATE_POOL - unique_semantic, TRENDING_LIMIT)
+        else:
+            trending_quota = TRENDING_LIMIT
+
+        logger.info(
+            "Retrieval quotas — Semantic (actual fetched): %d, Trending: %d (total target: %d)",
+            len(semantic_ids), trending_quota, TOTAL_CANDIDATE_POOL,
+        )
 
         # ── Channel 2: Trending retrieval (PostgreSQL) ───────────────────
         trending_ids = self._retrieve_trending(trending_quota)
