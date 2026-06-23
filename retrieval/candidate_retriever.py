@@ -273,7 +273,7 @@ class CandidateRetriever:
             cursor = conn.cursor()
 
             # ── Primary: trending_repositories table ──────────────────────────
-            results = self._query_trending_table(cursor, fetch_limit)
+            results = self._query_trending_table(conn, cursor, fetch_limit)
 
             if results:
                 logger.info(
@@ -304,7 +304,7 @@ class CandidateRetriever:
                 except Exception:
                     pass
 
-    def _query_trending_table(self, cursor, fetch_limit: int) -> list[dict[str, Any]]:
+    def _query_trending_table(self, conn, cursor, fetch_limit: int) -> list[dict[str, Any]]:
         """Query the trending_repositories table ordered by trending_rank.
 
         Returns an empty list if the table does not exist or has no rows.
@@ -341,6 +341,10 @@ class CandidateRetriever:
             err_str = str(exc).lower()
             if "does not exist" in err_str or "undefined" in err_str or "relation" in err_str:
                 logger.debug("trending_repositories table not found: %s", exc)
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
                 return []
             raise
 
