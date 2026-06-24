@@ -44,7 +44,7 @@ DISCOVERY_CATEGORIES: dict[str, list[str]] = {
 
 @dataclass(slots=True)
 class DiscoveryConfig:
-    total_limit: int = 120
+    total_limit: int = 170
     per_query: int = 20
     pages_per_query: int = 1
     random_seed: int | None = None

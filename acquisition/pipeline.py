@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
 logger = logging.getLogger("pipeline.acquisition")
@@ -12,8 +14,9 @@ logger = logging.getLogger("pipeline.acquisition")
 def run_acquisition(
     token: str,
     *,
-    limit: int = 100,
-    batch_size: int = 10,
+    limit: int = 150,
+    batch_size: int = 15,
+    workers: int = 4,
     existing_repos: set[str] | None = None,
 ) -> list[Any]:
     """
@@ -56,32 +59,50 @@ def run_acquisition(
         )
         discovered = new_discovered
 
-    # ── Step 2: Enrichment in batches ─────────────────────────────────────────
-    logger.info("Enriching in batches of %d …", batch_size)
+    # ── Step 2: Concurrent enrichment ─────────────────────────────────────────
+    targets = discovered[:limit]
+    logger.info(
+        "Enriching %d repos with %d concurrent worker(s) …",
+        len(targets), workers,
+    )
     enriched: list = []
-    targets       = discovered[:limit]
-    total_batches = (len(targets) + batch_size - 1) // batch_size
 
-    for i in range(total_batches):
-        batch = targets[i * batch_size : (i + 1) * batch_size]
-        try:
-            results = enricher.get_repositories_batch(batch)
-            enriched.extend(results)
-            logger.info(
-                "  Batch %d/%d → +%d enriched  (total: %d)",
-                i + 1, total_batches, len(results), len(enriched),
+    # Each worker thread gets its own GitHubGraphQLClient (and requests.Session)
+    # so concurrent threads never race on a shared Session object.
+    _thread_local = threading.local()
+
+    def _get_thread_enricher() -> "RepositoryEnricher":
+        if not hasattr(_thread_local, "enricher"):
+            from acquisition.github_graphql_client import GitHubGraphQLClient
+            from acquisition.repository_enricher import RepositoryEnricher
+            _thread_local.enricher = RepositoryEnricher(
+                graphql_client=GitHubGraphQLClient(token=token)
             )
-        except Exception as exc:
-            logger.warning("  Batch %d failed (%s). Falling back to one-by-one …", i + 1, exc)
-            for repo in batch:
-                full_name = repo if isinstance(repo, str) else repo.get("full_name", "")
-                try:
-                    r = enricher.enrich(full_name)
-                    if r:
-                        enriched.append(r)
-                        logger.info("    ✓  %s", full_name)
-                except Exception as exc2:
-                    logger.warning("    ✗  %s: %s", full_name, exc2)
+        return _thread_local.enricher
+
+    def _enrich_one(repo: Any) -> Any:
+        return _get_thread_enricher().enrich(repo)
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        # Submit all enrich() calls concurrently; each is an independent GraphQL
+        # round-trip so workers spend their time waiting on network, not the CPU.
+        futures = {
+            executor.submit(_enrich_one, repo): repo
+            for repo in targets
+        }
+        for future in as_completed(futures):
+            repo = futures[future]
+            full_name = repo if isinstance(repo, str) else repo.get("full_name", "")
+            try:
+                result = future.result()
+                if result:
+                    enriched.append(result)
+                    logger.info("  ✓  %-44s (total enriched: %d)", full_name, len(enriched))
+                else:
+                    logger.warning("  ✗  %s: enricher returned None", full_name)
+            except Exception as exc:
+                logger.warning("  ✗  %s: %s", full_name, exc)
 
     logger.info("Acquisition complete — %d / %d repos enriched", len(enriched), limit)
     return enriched
+

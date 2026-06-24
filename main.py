@@ -48,79 +48,25 @@ logger = logging.getLogger("pipeline.acquisition")
 def run_acquisition(
     token: str,
     *,
-    limit: int = 100,
-    batch_size: int = 10,
+    limit: int = 150,
+    batch_size: int = 15,
+    workers: int = 4,
     existing_repos: set[str] | None = None,
 ) -> list:
     """
     Discover and enrich GitHub repositories via GraphQL only.
 
-    Returns a list of EnrichmentResult objects. Each carries:
-      .repo_id          — "owner/repo"
-      .payload          — Osiris-compatible dict (star_count, language, topics, …)
-      .raw_repository   — raw GraphQL response fields
-      .readme           — ReadmeDocument (clean_text, extracted_paragraphs, …)
-      .topics           — list[str]
-      .languages        — dict[str, int]  (language → bytes)
+    Delegates to acquisition.pipeline.run_acquisition which implements
+    concurrent enrichment via ThreadPoolExecutor.
     """
-    from acquisition.github_graphql_client import GitHubGraphQLClient
-    from acquisition.github_discovery import GitHubDiscoveryEngine, DiscoveryConfig
-    from acquisition.repository_enricher import RepositoryEnricher
-
-    client   = GitHubGraphQLClient(token=token)
-    # Fetch a larger buffer of candidate repositories to account for filtering duplicates
-    discovery_limit = limit + 50 if existing_repos else limit + 20
-    config   = DiscoveryConfig(total_limit=discovery_limit)
-    discovery = GitHubDiscoveryEngine(client, config=config)
-    enricher  = RepositoryEnricher(graphql_client=client)
-
-    # ── Step 1: Discovery ─────────────────────────────────────────────────────
-    logger.info("Discovering repositories …")
-    discovered = discovery.discover(limit=discovery_limit)
-    logger.info("Discovered %d candidate repos", len(discovered))
-
-    if existing_repos:
-        new_discovered = []
-        for r in discovered:
-            full_name = r if isinstance(r, str) else r.get("full_name", "")
-            if full_name not in existing_repos:
-                new_discovered.append(r)
-        logger.info(
-            "Filtered out %d already existing repos from candidates. %d new candidates remain.",
-            len(discovered) - len(new_discovered),
-            len(new_discovered),
-        )
-        discovered = new_discovered
-
-    # ── Step 2: Enrichment in batches ─────────────────────────────────────────
-    logger.info("Enriching in batches of %d …", batch_size)
-    enriched: list = []
-    targets       = discovered[:limit]
-    total_batches = (len(targets) + batch_size - 1) // batch_size
-
-    for i in range(total_batches):
-        batch = targets[i * batch_size : (i + 1) * batch_size]
-        try:
-            results = enricher.get_repositories_batch(batch)
-            enriched.extend(results)
-            logger.info(
-                "  Batch %d/%d → +%d enriched  (total: %d)",
-                i + 1, total_batches, len(results), len(enriched),
-            )
-        except Exception as exc:
-            logger.warning("  Batch %d failed (%s). Falling back to one-by-one …", i + 1, exc)
-            for repo in batch:
-                full_name = repo if isinstance(repo, str) else repo.get("full_name", "")
-                try:
-                    r = enricher.enrich(full_name)
-                    if r:
-                        enriched.append(r)
-                        logger.info("    ✓  %s", full_name)
-                except Exception as exc2:
-                    logger.warning("    ✗  %s: %s", full_name, exc2)
-
-    logger.info("Acquisition complete — %d / %d repos enriched", len(enriched), limit)
-    return enriched
+    from acquisition.pipeline import run_acquisition as _run_acquisition
+    return _run_acquisition(
+        token,
+        limit=limit,
+        batch_size=batch_size,
+        workers=workers,
+        existing_repos=existing_repos,
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -262,8 +208,9 @@ def _parse_args() -> argparse.Namespace:
         prog="main.py",
         description="gh-social-ml acquisition pipeline: Discovery → Enrichment → Quality Filter",
     )
-    p.add_argument("--limit",            type=int, default=100,    help="Maximum number of repositories to fetch in this run (default: 100)")
-    p.add_argument("--batch-size",       type=int, default=10,     help="Enrichment batch size (default: 10)")
+    p.add_argument("--limit",            type=int, default=150,    help="Maximum number of repositories to fetch in this run (default: 150)")
+    p.add_argument("--batch-size",       type=int, default=15,     help="Enrichment batch size (default: 15)")
+    p.add_argument("--workers",          type=int, default=4,      help="Concurrent enrichment workers (default: 4)")
     p.add_argument("--min-readme-chars", type=int, default=200,    help="Minimum README length to keep a repo (default: 200)")
     p.add_argument("--index-qdrant",     action="store_true",      help="Deprecated: Qdrant indexing now runs by default")
     p.add_argument("--no-index-qdrant",  action="store_true",      help="Skip automatic Qdrant indexing after filtering")
@@ -309,7 +256,7 @@ if __name__ == "__main__":
     else:
         logger.info("Database connector is not enabled. Ingestion/hydration will be disabled.")
 
-    target_count = 1000
+    target_count = 3000
     kept = []
 
     # ── Step 2: Fetch & Index if under target ─────────────────────────────────
@@ -349,7 +296,7 @@ if __name__ == "__main__":
                     except Exception:
                         pass
 
-        enriched = run_acquisition(token, limit=fetch_limit, batch_size=args.batch_size, existing_repos=existing_repos)
+        enriched = run_acquisition(token, limit=fetch_limit, batch_size=args.batch_size, workers=args.workers, existing_repos=existing_repos)
         kept, dropped = filter_enriched(enriched, min_readme_chars=args.min_readme_chars)
 
         logger.info(
@@ -392,7 +339,7 @@ if __name__ == "__main__":
 
     # ── Step 3: Integrated Candidate Retrieval + Ranking Demo ──────────────────
     if current_count >= target_count:
-        logger.info("Corpus target of 1000 reached. Executing Integrated Retrieval + Ranking Demo...")
+        logger.info("Corpus target of 3000 reached. Executing Integrated Retrieval + Ranking Demo...")
         try:
             from scripts.mock_users import MOCK_USERS
             from scripts.user_onboarding import onboard_user
