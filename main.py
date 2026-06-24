@@ -390,57 +390,72 @@ if __name__ == "__main__":
             except Exception as exc:
                 logger.error("Qdrant indexing failed: %s", exc)
 
-    # ── Step 3: Candidate Retrieval for Hardcoded Users ───────────────────────
+    # ── Step 3: Integrated Candidate Retrieval + Ranking Demo ──────────────────
     if current_count >= target_count:
-        logger.info("Corpus target of 1000 reached. Executing L1 Candidate Retrieval Demo...")
+        logger.info("Corpus target of 1000 reached. Executing Integrated Retrieval + Ranking Demo...")
         try:
             from scripts.mock_users import MOCK_USERS
-            from retrieval import CandidateRetriever
-            from scripts.user_onboarding import generate_interest_vector
+            from scripts.user_onboarding import onboard_user
+            from retrieval_engine import RetrievalEngine
 
-            retriever = CandidateRetriever(
-                db_connector=db,
+            # 1. Onboard the mock users to Qdrant so the retrieval engine can fetch their profiles
+            logger.info("Onboarding mock users to Qdrant...")
+            for user in MOCK_USERS:
+                onboard_user(user_id=user["user_id"], user_data=user)
+
+            engine = RetrievalEngine(
                 qdrant_url=args.qdrant_url,
-                qdrant_api_key=args.qdrant_api_key
+                qdrant_api_key=args.qdrant_api_key,
             )
 
             print("\n" + "═" * 80)
-            print("                 L1 CANDIDATE RETRIEVAL PIPELINE DEMO")
+            print("         INTEGRATED L1 RETRIEVAL & L2 MMoE RANKING DEMO")
             print("═" * 80)
 
             for user in MOCK_USERS:
-                print(f"\n👤 USER: {user['full_name']} (@{user['user_id']})")
+                uid = user["user_id"]
+                print(f"\n👤 USER: {user['full_name']} (@{uid})")
                 print(f"   Bio: {user['bio']}")
                 print(f"   Interests: {user['interests']}")
-                print("   Generating user interest vector...")
+                print("   Fetching and ranking recommendation batches (bypassing cache)...")
 
-                user_vector = generate_interest_vector(user)
+                # Force invalidate cache for demo freshness
+                if engine.db and engine.db.enabled:
+                    conn = None
+                    try:
+                        conn = engine.db.connect()
+                        cursor = conn.cursor()
+                        cursor.execute("DELETE FROM user_recommendation_batches WHERE user_id = %s;", (uid,))
+                        conn.commit()
+                    except Exception:
+                        if conn:
+                            conn.rollback()
+                    finally:
+                        if conn:
+                            conn.close()
 
-                print("   Running multi-channel retrieval (Target: 120 Semantic, 30 Trending)...")
-                candidates = retriever.retrieve_candidates(
-                    user_embedding=user_vector,
-                    user_interests=user["interests"]
-                )
+                batches = engine.fetch_onboarding_batches(uid)
 
-                print(f"   Successfully retrieved {len(candidates)} candidates.")
-                print("-" * 80)
-                print(f"{'#':<4} {'Repository':<42} {'Source':<10} {'Score/Stars':<12} {'Embedding Hydrated?'}")
-                print("-" * 80)
-                for i, c in enumerate(candidates, 1):
-                    source = c.get("retrieval_source", "unknown")
-                    score_str = "—"
-                    if source == "semantic":
-                        score_str = f"{c.get('retrieval_score', 0.0):.4f}"
-                    elif source == "trending":
-                        score_str = f"{c.get('star_count', 0):,} stars"
-                    
-                    has_embedding = "Yes (384-d)" if c.get("repo_embedding") is not None and len(c.get("repo_embedding")) == 384 else "No"
-                    print(f"{i:<4} {c.get('full_name') or 'Unknown':<42} {source:<10} {score_str:<12} {has_embedding}")
+                for batch_name, title in [
+                    ("batch_1", "Batch 1 — Top Picks"),
+                    ("batch_2", "Batch 2 — Mid Tier"),
+                    ("batch_3", "Batch 3 — Discovery"),
+                ]:
+                    batch = batches.get(batch_name, [])
+                    print(f"\n  ── {title} ({len(batch)} repos) ──")
+                    print(f"  {'#':<3} {'MMoE Score':>10}  {'Source':<12} {'Repo':<42} Language")
+                    print(f"  {'-'*3} {'-'*10}  {'-'*12} {'-'*42} {'-'*12}")
+                    for i, item in enumerate(batch, 1):
+                        score = item.get("final_score") or item.get("cosine_score") or 0.0
+                        repo_name = (item.get("full_name") or item.get("repo_id") or "?")[:42]
+                        source = item.get("retrieval_source", "?")[:12]
+                        lang = (item.get("primary_language") or "")[:12]
+                        print(f"  {i:<3} {score:>10.4f}  {source:<12} {repo_name:<42} {lang}")
                 print("═" * 80)
         except Exception as exc:
-            logger.error(f"Failed to run Candidate Retrieval demo: {exc}", exc_info=True)
+            logger.error(f"Failed to run Integrated Retrieval + Ranking demo: {exc}", exc_info=True)
     else:
         logger.warning(
             f"Approved corpus size is currently {current_count} repositories. "
-            f"L1 Candidate Retrieval Demo will run once the corpus reaches the target of {target_count} repositories."
+            f"Integrated Retrieval + Ranking Demo will run once the corpus reaches the target of {target_count} repositories."
         )

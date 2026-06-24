@@ -100,6 +100,9 @@ class CandidateRetriever:
                 "Run 'pip install qdrant-client' to enable."
             )
 
+        # Lazy embedder for on-the-fly embedding of trending repos
+        self._embedder = None
+
     # ══════════════════════════════════════════════════════════════════════
     #  PUBLIC API
     # ══════════════════════════════════════════════════════════════════════
@@ -247,16 +250,17 @@ class CandidateRetriever:
     # ══════════════════════════════════════════════════════════════════════
 
     def _retrieve_trending(self, quota: int) -> list[dict[str, Any]]:
-        """Query PostgreSQL for trending repositories using a blended engagement score.
+        """Query PostgreSQL for trending repositories.
 
-        Formula: star_count + (forks_count * 5) + (pr_count * 10)
-        This captures actual user engagement (forking and contributing)
-        rather than just raw star count.
+        First queries the ``trending_repositories`` table populated by the
+        dedicated trending service.  Falls back to a star-count blended
+        engagement query on the ``Repo`` table if the trending table is empty
+        or does not exist.
         """
         if quota <= 0:
             return []
 
-        if not self.db.enabled:
+        if self.db is None or not self.db.enabled:
             logger.warning("PostgreSQL connector disabled. Trending channel returns empty.")
             return []
 
@@ -267,26 +271,27 @@ class CandidateRetriever:
         try:
             conn = self.db.connect()
             cursor = conn.cursor()
-            cursor.execute(
-                """
-                SELECT repo_id, full_name, star_count
-                FROM Repo
-                ORDER BY (star_count + COALESCE(forks_count, 0) * 5 + COALESCE(pr_count, 0) * 10) DESC
-                LIMIT %s;
-                """,
-                (fetch_limit,),
-            )
-            rows = cursor.fetchall()
 
-            results = []
-            for row in rows:
-                results.append({
-                    "repo_id": str(row[0]),
-                    "full_name": row[1],
-                    "star_count": row[2],
-                    "source": "trending",
-                })
-            logger.info("Trending channel retrieved %d candidates from PostgreSQL.", len(results))
+            # ── Primary: trending_repositories table ──────────────────────────
+            results = self._query_trending_table(conn, cursor, fetch_limit)
+
+            if results:
+                logger.info(
+                    "Trending channel retrieved %d candidates from trending_repositories.",
+                    len(results),
+                )
+                return results
+
+            # ── Fallback: Repo table with engagement blended score ────────────
+            logger.info(
+                "trending_repositories table empty or missing. "
+                "Falling back to Repo table engagement score."
+            )
+            results = self._query_repo_table_trending(cursor, fetch_limit)
+            logger.info(
+                "Trending channel retrieved %d candidates from Repo (fallback).",
+                len(results),
+            )
             return results
 
         except Exception as exc:
@@ -298,6 +303,72 @@ class CandidateRetriever:
                     conn.close()
                 except Exception:
                     pass
+
+    def _query_trending_table(self, conn, cursor, fetch_limit: int) -> list[dict[str, Any]]:
+        """Query the trending_repositories table ordered by trending_rank.
+
+        Returns an empty list if the table does not exist or has no rows.
+        """
+        try:
+            cursor.execute(
+                """
+                SELECT full_name, star_count, daily_stars, primary_language,
+                       topics, description, trending_rank
+                FROM trending_repositories
+                ORDER BY trending_rank ASC
+                LIMIT %s;
+                """,
+                (fetch_limit,),
+            )
+            rows = cursor.fetchall()
+            results = []
+            for row in rows:
+                full_name = row[0]
+                results.append({
+                    "repo_id": full_name,  # Fall back to full_name as the identifier
+                    "full_name": full_name,
+                    "star_count": row[1] or 0,
+                    "daily_stars": row[2] or 0,
+                    "primary_language": row[3] or "Unknown",
+                    "topics": row[4] or [],
+                    "description": row[5] or "",
+                    "trending_rank": row[6],
+                    "source": "trending",
+                })
+            return results
+        except Exception as exc:
+            # Table may not exist yet — treat as empty
+            err_str = str(exc).lower()
+            if "does not exist" in err_str or "undefined" in err_str or "relation" in err_str:
+                logger.debug("trending_repositories table not found: %s", exc)
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                return []
+            raise
+
+    def _query_repo_table_trending(self, cursor, fetch_limit: int) -> list[dict[str, Any]]:
+        """Query the Repo table ordered by a blended engagement score (fallback)."""
+        cursor.execute(
+            """
+            SELECT repo_id, full_name, star_count
+            FROM Repo
+            ORDER BY (star_count + COALESCE(forks_count, 0) * 5 + COALESCE(pr_count, 0) * 10) DESC
+            LIMIT %s;
+            """,
+            (fetch_limit,),
+        )
+        rows = cursor.fetchall()
+        return [
+            {
+                "repo_id": str(row[0]),
+                "full_name": row[1],
+                "star_count": row[2],
+                "source": "trending",
+            }
+            for row in rows
+        ]
 
     # ══════════════════════════════════════════════════════════════════════
     #  MERGE & DEDUPLICATION
@@ -360,6 +431,9 @@ class CandidateRetriever:
         """Enrich each candidate with full PostgreSQL metadata and Qdrant embeddings.
 
         This runs two batch queries (one to each database) to avoid N+1 problems.
+        Trending candidates that have no Qdrant point are embedded on-the-fly
+        using the same SentenceTransformerEmbedder used by the main pipeline,
+        so they always enter the ranker with a real semantic vector.
         """
         # Ensure every candidate has full_name and point_id populated
         for c in candidates:
@@ -378,8 +452,11 @@ class CandidateRetriever:
         embedding_map = self._batch_fetch_embeddings(point_ids)
 
         # ── Step 3: Join into final payload ──────────────────────────────
-        hydrated: list[dict[str, Any]] = []
-        for candidate in candidates:
+        # Collect candidates missing a Qdrant vector for on-the-fly embedding
+        needs_embedding: list[tuple[int, dict[str, Any]]] = []
+        hydrated: list[dict[str, Any]] = [{}] * len(candidates)
+
+        for i, candidate in enumerate(candidates):
             name = candidate.get("full_name")
             pid = candidate.get("point_id")
 
@@ -392,26 +469,101 @@ class CandidateRetriever:
             if name and name in metadata_map:
                 entry.update(metadata_map[name])
             else:
-                # include basic info if missing from DB
                 entry["full_name"] = name
 
-            # Attach embedding vector
+            # Attach embedding vector — or mark for on-the-fly generation
             if pid and pid in embedding_map:
                 entry["repo_embedding"] = embedding_map[pid]
+                entry["embedding_source"] = "qdrant"
             else:
-                # Provide zero-vector so downstream models don't crash
-                entry["repo_embedding"] = [0.0] * EMBEDDING_DIM
+                # No Qdrant point (typical for trending-only repos).
+                # Real embedding will be generated in Step 4.
+                entry["repo_embedding"] = None
+                needs_embedding.append((i, entry))
 
-            hydrated.append(entry)
+            hydrated[i] = entry
+
+        # ── Step 4: Batch embed all candidates missing a Qdrant vector ─────
+        if needs_embedding:
+            texts = [self._make_embedding_text(e) for _, e in needs_embedding]
+            try:
+                vectors = self._get_embedder().embed_texts(texts, normalize=True)
+                for (_, entry), vector in zip(needs_embedding, vectors):
+                    entry["repo_embedding"] = vector
+                    entry["embedding_source"] = "on_the_fly"
+                logger.info(
+                    "On-the-fly embedded %d trending repo(s) with no Qdrant vector.",
+                    len(needs_embedding),
+                )
+            except Exception as exc:
+                logger.warning(
+                    "On-the-fly embedding failed (%s). "
+                    "Falling back to zero-vector for %d repos.",
+                    exc, len(needs_embedding),
+                )
+                for _, entry in needs_embedding:
+                    if entry["repo_embedding"] is None:
+                        entry["repo_embedding"] = [0.0] * EMBEDDING_DIM
+                        entry["embedding_source"] = "zero_fallback"
 
         return hydrated
+
+    def _get_embedder(self):
+        """Lazy-load the SentenceTransformerEmbedder (same model as main pipeline)."""
+        if self._embedder is None:
+            from embedding.embeddings import SentenceTransformerEmbedder
+            self._embedder = SentenceTransformerEmbedder()
+            logger.info("Lazy-loaded SentenceTransformerEmbedder for on-the-fly trending embeddings.")
+        return self._embedder
+
+    @staticmethod
+    def _make_embedding_text(entry: dict[str, Any]) -> str:
+        """Build short descriptive text for embedding a trending repo.
+
+        Uses metadata + topic fields (no README) — the same signals as the
+        main pipeline's metadata and topic towers.
+        """
+        parts: list[str] = []
+
+        name = entry.get("full_name") or ""
+        if name:
+            parts.append(f"Repository: {name}")
+
+        desc = entry.get("description") or ""
+        if desc:
+            parts.append(f"Description: {desc}")
+
+        lang = entry.get("primary_language") or ""
+        if lang and lang != "Unknown":
+            parts.append(f"Primary language: {lang}")
+
+        topics = entry.get("topics") or []
+        if isinstance(topics, str):
+            import json as _json
+            try:
+                topics = _json.loads(topics)
+            except Exception:
+                topics = []
+        if topics:
+            parts.append("Topics: " + ", ".join(str(t) for t in topics))
+
+        stars = int(entry.get("star_count") or 0)
+        if stars:
+            parts.append(f"Stars: {stars}")
+
+        return "\n".join(parts) or name or "unknown repository"
 
     def _batch_fetch_metadata(
         self,
         full_names: list[str],
     ) -> dict[str, dict[str, Any]]:
-        """Fetch full metadata rows from PostgreSQL for a batch of repository full_names."""
-        if not full_names or not self.db.enabled:
+        """Fetch full metadata rows from PostgreSQL for a batch of repository full_names.
+
+        First queries the ``Repo`` table.  For any repositories not found there
+        (e.g. newly trending repos not yet ingested by the main pipeline), it
+        performs a supplementary lookup in ``trending_repositories``.
+        """
+        if not full_names or self.db is None or not self.db.enabled:
             return {}
 
         conn = None
@@ -419,7 +571,7 @@ class CandidateRetriever:
             conn = self.db.connect()
             cursor = conn.cursor()
 
-            # Query by full_name instead of repo_id
+            # ── Primary: Repo table ───────────────────────────────────────────
             cursor.execute(
                 """
                 SELECT repo_id, github_repo_url, owner_id, repo_name, full_name,
@@ -447,9 +599,21 @@ class CandidateRetriever:
                 result_map[row_dict["full_name"]] = row_dict
 
             logger.info(
-                "Metadata hydration: %d/%d full names found in PostgreSQL.",
+                "Metadata hydration: %d/%d full names found in Repo table.",
                 len(result_map), len(full_names),
             )
+
+            # ── Supplement: trending_repositories table for missing repos ─────
+            missing = [n for n in full_names if n not in result_map]
+            if missing:
+                trending_meta = self._fetch_metadata_from_trending(cursor, missing)
+                result_map.update(trending_meta)
+                if trending_meta:
+                    logger.info(
+                        "Metadata hydration: %d supplemental entries from trending_repositories.",
+                        len(trending_meta),
+                    )
+
             return result_map
 
         except Exception as exc:
@@ -461,6 +625,54 @@ class CandidateRetriever:
                     conn.close()
                 except Exception:
                     pass
+
+    def _fetch_metadata_from_trending(
+        self,
+        cursor,
+        full_names: list[str],
+    ) -> dict[str, dict[str, Any]]:
+        """Fetch repository metadata from trending_repositories for names not in Repo."""
+        try:
+            cursor.execute(
+                """
+                SELECT full_name, description, primary_language, topics,
+                       star_count, daily_stars, fork_count, url, trending_rank
+                FROM trending_repositories
+                WHERE full_name = ANY(%s);
+                """,
+                (full_names,),
+            )
+            result_map: dict[str, dict[str, Any]] = {}
+            for row in cursor.fetchall():
+                full_name = row[0]
+                # Normalise to the same shape expected by the ranker/assembler
+                topics = row[3]
+                if isinstance(topics, str):
+                    import json
+                    try:
+                        topics = json.loads(topics)
+                    except Exception:
+                        topics = []
+                result_map[full_name] = {
+                    "repo_id": full_name,
+                    "github_repo_url": row[7] or f"https://github.com/{full_name}",
+                    "full_name": full_name,
+                    "description": row[1] or "",
+                    "primary_language": row[2] or "Unknown",
+                    "topics": topics or [],
+                    "star_count": row[4] or 0,
+                    "daily_stars": row[5] or 0,
+                    "forks_count": row[6] or 0,
+                    "trending_rank": row[8],
+                }
+            return result_map
+        except Exception as exc:
+            err_str = str(exc).lower()
+            if "does not exist" in err_str or "relation" in err_str:
+                logger.debug("trending_repositories table unavailable for supplement: %s", exc)
+                return {}
+            logger.warning("Supplemental trending metadata fetch failed: %s", exc)
+            return {}
 
     def _batch_fetch_embeddings(
         self,

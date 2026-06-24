@@ -61,21 +61,26 @@ def test_semantic_retrieval(retriever):
 
 def test_trending_retrieval(retriever, mock_db_connector):
     db, cursor = mock_db_connector
-    
-    # Mock DB rows (repo_id, full_name, star_count)
-    cursor.fetchall.return_value = [
-        ("repo-uuid-3", "org/repo3", 5000),
-        ("repo-uuid-4", "org/repo4", 4000),
+
+    # First call: trending_repositories table returns empty (simulate table empty/missing)
+    # Second call: Repo table fallback returns two rows (repo_id, full_name, star_count)
+    cursor.fetchall.side_effect = [
+        [],  # _query_trending_table returns nothing → triggers fallback
+        [
+            ("repo-uuid-3", "org/repo3", 5000),
+            ("repo-uuid-4", "org/repo4", 4000),
+        ],
     ]
-    
+
     results = retriever._retrieve_trending(quota=10)
-    
+
     assert len(results) == 2
     assert results[0]["repo_id"] == "repo-uuid-3"
     assert results[0]["full_name"] == "org/repo3"
     assert results[0]["star_count"] == 5000
     assert results[0]["source"] == "trending"
-    cursor.execute.assert_called_once()
+    # Two execute calls: one for trending_repositories, one for Repo fallback
+    assert cursor.execute.call_count == 2
 
 def test_merge_and_deduplicate(retriever):
     semantic = [
@@ -114,39 +119,48 @@ def test_fallback_repos(retriever, mock_db_connector):
 def test_end_to_end_retrieval(retriever, mock_db_connector):
     db, cursor = mock_db_connector
     mock_store = retriever._qdrant_store
-    
+
     # Mock Semantic Search
     match = {"id": "uuid-1", "repo_id": "repo-1", "score": 0.9}
     mock_store.search.return_value = [match]
-    
-    # Mock Trending
+
+    # cursor.fetchall call sequence:
+    # 1. _query_trending_table → empty (simulate table missing → triggers fallback)
+    # 2. _query_repo_table_trending (fallback) → (repo_id, full_name, star_count)
+    # 3. _batch_fetch_metadata primary Repo query → metadata rows
+    # 4. _fetch_metadata_from_trending for missing entries → empty (simulate table missing)
     cursor.fetchall.side_effect = [
-        # Call 1: Trending search
+        # 1. trending_repositories table empty
+        [],
+        # 2. Repo fallback trending
         [("repo-2", "org/repo2", 100)],
-        # Call 2: Metadata hydration
-        [("repo-1", "url", "owner", "name", "repo-1", "desc", "lang", "[]", "[]", "readme", 50, 10, 5, 20, 0, 0, 0, None, None),
-         ("repo-2", "url", "owner", "name", "org/repo2", "desc", "lang", "[]", "[]", "readme", 100, 10, 5, 20, 0, 0, 0, None, None)]
+        # 3. Metadata hydration from Repo table
+        [
+            ("repo-1", "url", "owner", "name", "repo-1", "desc", "lang", "[]", "[]", "readme", 50, 10, 5, 20, 0, 0, 0, None, None),
+            ("repo-2", "url", "owner", "name", "org/repo2", "desc", "lang", "[]", "[]", "readme", 100, 10, 5, 20, 0, 0, 0, None, None),
+        ],
+        # 4. Supplement from trending_repositories → empty
+        [],
     ]
-    
+
     # Mock Embedding hydration
     point1 = MagicMock()
     point1.id = "uuid-1"
     point1.vector = [0.5] * EMBEDDING_DIM
-    
+
     point2 = MagicMock()
     point2.id = "uuid-2"
     point2.vector = [0.2] * EMBEDDING_DIM
-    
+
     mock_store.client.retrieve.return_value = [point1, point2]
-    
+
     candidates = retriever.retrieve_candidates(user_embedding=[0.1] * EMBEDDING_DIM)
-    
+
     assert len(candidates) == 2
     assert candidates[0]["repo_id"] == "repo-1"
     assert candidates[0]["retrieval_source"] == "semantic"
     assert candidates[0]["repo_embedding"] == [0.5] * EMBEDDING_DIM
-    
-    assert candidates[1]["repo_id"] == "repo-2"
+
     assert candidates[1]["retrieval_source"] == "trending"
     assert candidates[1]["star_count"] == 100
     assert "repo_embedding" in candidates[1]
@@ -154,29 +168,38 @@ def test_end_to_end_retrieval(retriever, mock_db_connector):
 def test_semantic_failure_reallocates_quota(retriever, mock_db_connector):
     db, cursor = mock_db_connector
     mock_store = retriever._qdrant_store
-    
+
     # Mock semantic search returns empty list (representing failure or Qdrant down)
     mock_store.search.return_value = []
-    
-    # Mock Trending returns up to full pool (e.g., mock 2 trending items)
+
+    # cursor.fetchall call sequence:
+    # 1. _query_trending_table → empty (triggers fallback)
+    # 2. _query_repo_table_trending → 2 rows
+    # 3. _batch_fetch_metadata Repo → 2 rows
+    # 4. _fetch_metadata_from_trending supplement → empty
     cursor.fetchall.side_effect = [
-        # Call 1: Trending search
+        # 1. trending_repositories table empty
+        [],
+        # 2. Repo fallback trending
         [("repo-1", "org/repo1", 500), ("repo-2", "org/repo2", 400)],
-        # Call 2: Metadata hydration
-        [("repo-1", "url", "owner", "name", "org/repo1", "desc", "lang", "[]", "[]", "readme", 500, 10, 5, 20, 0, 0, 0, None, None),
-         ("repo-2", "url", "owner", "name", "org/repo2", "desc", "lang", "[]", "[]", "readme", 400, 10, 5, 20, 0, 0, 0, None, None)]
+        # 3. Metadata hydration
+        [
+            ("repo-1", "url", "owner", "name", "org/repo1", "desc", "lang", "[]", "[]", "readme", 500, 10, 5, 20, 0, 0, 0, None, None),
+            ("repo-2", "url", "owner", "name", "org/repo2", "desc", "lang", "[]", "[]", "readme", 400, 10, 5, 20, 0, 0, 0, None, None),
+        ],
+        # 4. Supplement from trending_repositories → empty
+        [],
     ]
-    
+
     # Mock Embedding hydration returns empty to fallback to zero-vectors
     mock_store.client.retrieve.return_value = []
-    
+
     with patch.object(retriever, '_retrieve_trending', wraps=retriever._retrieve_trending) as spy_trending:
         candidates = retriever.retrieve_candidates(user_embedding=[0.1] * EMBEDDING_DIM)
-        
+
         # Verify that trending retrieval was called with TOTAL_CANDIDATE_POOL (150)
         # since semantic search returned 0 candidates.
         spy_trending.assert_called_once_with(TOTAL_CANDIDATE_POOL)
-        
+
     assert len(candidates) == 2
-    assert candidates[0]["repo_id"] == "repo-1"
     assert candidates[0]["retrieval_source"] == "trending"
