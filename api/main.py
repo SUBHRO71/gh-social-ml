@@ -1,5 +1,11 @@
 import logging
 import os
+
+# Load .env FIRST — before any imports that call os.getenv() at module level
+# (e.g. scripts/user_onboarding.py reads QDRANT_URL on import)
+from dotenv import load_dotenv
+load_dotenv()
+
 from contextlib import asynccontextmanager
 from fastapi import Depends, FastAPI, Header, HTTPException, status
 from fastapi.concurrency import run_in_threadpool
