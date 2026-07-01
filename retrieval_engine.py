@@ -479,7 +479,7 @@ class RetrievalEngine:
             c_copy["final_score"] = final_score
             c_copy["predictions"] = preds
             c_copy["score_source"] = f"mmoe_{source}"
-            c_copy["languages"] = languages
+            c_copy["languages"] = inp.get("languages", [])
             enriched.append(c_copy)
 
         enriched.sort(key=lambda x: x["final_score"], reverse=True)
