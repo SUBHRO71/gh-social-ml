@@ -180,9 +180,8 @@ class FeedbackHandler:
             logger.error("Forbidden database column update: '%s'", column)
             return False
 
-        conn = None
         try:
-            conn = self.db.connect()
+            conn = self.db._get_connection()
             cursor = conn.cursor()
 
             # Increment count defensively handling NULL values using COALESCE
@@ -205,12 +204,6 @@ class FeedbackHandler:
                 except Exception:
                     pass
             return False
-        finally:
-            if conn:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
 
     def _resolve_repo_full_name(self, repo_id: str) -> str:
         """Resolve a Postgres UUID back to full_name. If already full_name, return it."""
@@ -220,20 +213,24 @@ class FeedbackHandler:
             return repo_id
         conn = None
         try:
-            conn = self.db.connect()
+            conn = self.db._get_connection()
             cursor = conn.cursor()
             cursor.execute("SELECT full_name FROM repo WHERE repo_id::text = %s", (repo_id,))
             row = cursor.fetchone()
-            if row: return row[0]
+            if row:
+                conn.commit()
+                return row[0]
             cursor.execute("SELECT full_name FROM trending_repositories WHERE repo_id::text = %s", (repo_id,))
             row = cursor.fetchone()
-            if row: return row[0]
+            if row:
+                conn.commit()
+                return row[0]
+            conn.commit()
         except Exception as e:
             logger.error("Error resolving repo full_name: %s", e)
-        finally:
             if conn:
                 try:
-                    conn.close()
+                    conn.rollback()
                 except Exception:
                     pass
         return repo_id
@@ -339,7 +336,7 @@ class FeedbackHandler:
 
         conn = None
         try:
-            conn = self.db.connect()
+            conn = self.db._get_connection()
             cursor = conn.cursor()
 
             # Delete cache row for user
@@ -357,9 +354,3 @@ class FeedbackHandler:
                 except Exception:
                     pass
             return False
-        finally:
-            if conn:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
