@@ -9,12 +9,29 @@ USER_UUID = "123e4567-e89b-12d3-a456-426614174000"
 
 
 def test_initial_feedback_weights_are_centralized_and_bounded():
+    assert get_interaction("impression").feedback_score == 0.0
+    assert get_interaction("impression").persists_feedback is False
+    assert get_interaction("readme_open").feedback_score == 0.2
+    assert get_interaction("github_open").feedback_score == 0.3
     assert get_interaction("like").feedback_score == 1.0
     assert get_interaction("save").feedback_score == 0.8
+    assert get_interaction("share").feedback_score == 0.6
     assert get_interaction("dislike").feedback_score == -1.0
+    assert get_interaction("undislike").clears_interaction_type == "dislike"
     assert all(
         -1.0 <= get_interaction(action).feedback_score <= 1.0
-        for action in ("like", "save", "dislike")
+        for action in (
+            "impression",
+            "readme_open",
+            "github_open",
+            "like",
+            "save",
+            "share",
+            "dislike",
+            "undislike",
+            "unlike",
+            "unsave",
+        )
     )
 
 

@@ -42,7 +42,7 @@ def _dwell_alpha(dwell_seconds: float) -> Optional[float]:
     Returns
     -------
     float  — learning rate to pass to shift_vector
-    None   — dwell is below MIN_DWELL_SECONDS (accidental scroll); skip update
+    None   — dwell is below MIN_DWELL_SECONDS (accidental scroll); ignore update
     """
     # The below threshold is for filtering out accidental card flicks that
     # should not influence the interest vector at all.
@@ -118,7 +118,7 @@ class FeedbackHandler:
         ----------
         user_id       : Unique user identifier.
         repo_id       : Repository full_name or UUID.
-        action        : One of click | like | save | skip | dwell.
+        action        : One of the versioned feedback contract actions or dwell.
         dwell_seconds : Required when action == 'dwell'. Observed time the user
                         spent on the repository card, in seconds.
         """
@@ -161,7 +161,9 @@ class FeedbackHandler:
         db_success = True
         if action != "dwell":
             try:
-                if interaction.clears_interaction_type:
+                if not interaction.persists_feedback:
+                    pass
+                elif interaction.clears_interaction_type:
                     self.store.delete(
                         user_id,
                         repo_id,
@@ -202,7 +204,7 @@ class FeedbackHandler:
             except ValueError:
                 column = None
         if column is None or not self.db.enabled:
-            # 'skip' and 'dwell' have no Postgres counter — treat as success
+            # Neutral/implicit actions and dwell have no Postgres counter — treat as success
             return True
 
         # Guard against SQL injection via strict whitelist validation (defense-in-depth)
@@ -273,8 +275,8 @@ class FeedbackHandler:
         ----------
         user_id : Unique user identifier.
         repo_id : Repository full_name or UUID.
-        alpha   : Signed learning rate.  Positive → shift toward repo (interest).
-                  Negative → shift away (disinterest, e.g. skip).
+        alpha   : Signed learning rate. Positive shifts toward the repo; negative
+                  shifts away for explicit disinterest.
         """
         if not self.qdrant:
             logger.warning("Qdrant client not configured; skipping vector shift.")

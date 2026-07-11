@@ -74,7 +74,7 @@ class FeedbackRequest(BaseModel):
     repo_id: str = Field(..., description="Full name or UUID of the repository")
     action: str = Field(
         ...,
-        description="Interaction action type: click, like, save, skip, or dwell",
+        description="Versioned feedback action type",
     )
     dwell_seconds: float | None = Field(
         default=None,
@@ -158,7 +158,7 @@ async def submit_feedback(request: FeedbackRequest):
     """Submit a user interaction event.
 
     Pushes the event to the processing queue and returns 202 Accepted.
-    Supported actions: ``click``, ``like``, ``save``, ``skip``, ``dwell``.
+    Supported actions are the versioned feedback contract actions plus ``dwell``.
     When ``action`` is ``dwell``, ``dwell_seconds`` must be provided and > 0.
     """
     action = request.action.lower()

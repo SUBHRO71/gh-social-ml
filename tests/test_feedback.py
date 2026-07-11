@@ -293,6 +293,40 @@ def test_clear_actions_only_delete_the_matching_positive_signal():
     handler.store.record.assert_not_called()
 
 
+def test_undislike_only_clears_dislike_signal():
+    """Toggling thumb-down off must not be reported as unlike."""
+    mock_db = MagicMock()
+    mock_db.enabled = False
+    with patch("feedback.event_handlers.QdrantClient"):
+        handler = FeedbackHandler(db_connector=mock_db, qdrant_url="http://localhost:6333")
+    handler.store = MagicMock()
+    handler.update_postgres_metrics = MagicMock(return_value=True)
+    handler.invalidate_user_feed_cache = MagicMock(return_value=True)
+
+    assert handler.handle_feedback(USER_UUID, "facebook/react", "undislike") is True
+    handler.store.delete.assert_called_once_with(
+        USER_UUID,
+        "facebook/react",
+        interaction_type="dislike",
+    )
+    handler.store.record.assert_not_called()
+
+
+def test_impression_does_not_create_effective_feedback():
+    """A passive impression is neutral and must not overwrite explicit feedback."""
+    mock_db = MagicMock()
+    mock_db.enabled = False
+    with patch("feedback.event_handlers.QdrantClient"):
+        handler = FeedbackHandler(db_connector=mock_db, qdrant_url="http://localhost:6333")
+    handler.store = MagicMock()
+    handler.update_postgres_metrics = MagicMock(return_value=True)
+    handler.invalidate_user_feed_cache = MagicMock(return_value=True)
+
+    assert handler.handle_feedback(USER_UUID, "facebook/react", "impression") is True
+    handler.store.record.assert_not_called()
+    handler.store.delete.assert_not_called()
+
+
 @pytest.mark.anyio
 async def test_consumer_redis_loop_success():
     """Test that a message is successfully processed and acknowledged in Redis stream loop."""
