@@ -253,7 +253,11 @@ class FeedbackHandler:
                                         self.redis_client.lpush("qdrant_rollback_dlq", dlq_payload)
                                     except Exception:
                                         pass
-                            qdrant_success = False
+                            
+                            if rollback_success:
+                                qdrant_success = False
+                            else:
+                                logger.warning("Proceeding to Postgres commit to durably save the shifted state.")
 
                         if not qdrant_success:
                             logger.warning("Failed to adjust Qdrant profile embedding for user '%s'", user_id)
