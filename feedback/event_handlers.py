@@ -223,12 +223,22 @@ class FeedbackHandler:
                         logger.info("Qdrant vector shift already applied for message %s. Skipping.", message_id)
                     else:
                         qdrant_success = self.update_user_embedding(user_id, repo_id, resolved_alpha)
+                        marker_written = False
                         if qdrant_success and qdrant_applied_key and self.redis_client:
                             try:
                                 # Mark as applied so retries don't double shift
                                 self.redis_client.set(qdrant_applied_key, "1", ex=86400 * 7)
-                            except Exception:
-                                pass
+                                marker_written = True
+                            except Exception as exc:
+                                logger.error("Failed to write Qdrant replay marker to Redis: %s", exc)
+                        
+                        if qdrant_success and qdrant_applied_key and not marker_written:
+                            # We failed to write the marker!
+                            # We CANNOT proceed to Postgres commit, because if Postgres fails, we can't protect the retry!
+                            logger.warning("Rolling back Qdrant vector shift because replay marker could not be written.")
+                            self.update_user_embedding(user_id, repo_id, -resolved_alpha)
+                            qdrant_success = False
+
                         if not qdrant_success:
                             logger.warning("Failed to adjust Qdrant profile embedding for user '%s'", user_id)
                 else:
@@ -240,36 +250,30 @@ class FeedbackHandler:
                         conn.commit()
                     except Exception as exc:
                         conn.rollback()
-                        # Postgres failed. We MUST rollback Qdrant to safely retry.
+                        # Postgres failed. We MUST rollback Qdrant to safely retry, UNLESS we have a marker!
                         if state_changed and resolved_alpha != 0.0:
-                            logger.error("Postgres commit failed, attempting to rollback Qdrant vector shift...")
-                            rollback_success = self.update_user_embedding(user_id, repo_id, -resolved_alpha)
+                            has_marker = qdrant_already_applied or locals().get('marker_written', False)
                             
-                            if rollback_success and qdrant_applied_key and self.redis_client:
-                                try:
-                                    # Rollback succeeded, remove idempotency key so retry re-applies it
-                                    self.redis_client.delete(qdrant_applied_key)
-                                except Exception:
-                                    pass
-                                    
-                            if not rollback_success:
-                                logger.critical("CRITICAL: Failed to rollback Qdrant for user '%s'.", user_id)
-                                if self.redis_client:
-                                    try:
-                                        import json
-                                        dlq_payload = json.dumps({
-                                            "user_id": user_id,
-                                            "repo_id": repo_id,
-                                            "compensating_alpha": -resolved_alpha,
-                                            "error": str(exc)
-                                        })
-                                        self.redis_client.lpush("qdrant_rollback_dlq", dlq_payload)
-                                    except Exception:
-                                        pass
-                                # If rollback fails, the idempotency key REMAINS in Redis.
-                                # This means when the event is retried, Qdrant will be skipped!
-                                # So we CAN safely retry, because Qdrant won't double-shift!
-                                # We no longer need to return True and lose the Postgres row!
+                            if has_marker:
+                                logger.warning("Postgres commit failed, but Qdrant vector shift is protected by marker. Skipping rollback.")
+                            else:
+                                logger.error("Postgres commit failed and no replay marker exists, attempting to rollback Qdrant vector shift...")
+                                rollback_success = self.update_user_embedding(user_id, repo_id, -resolved_alpha)
+                                        
+                                if not rollback_success:
+                                    logger.critical("CRITICAL: Failed to rollback Qdrant for user '%s'.", user_id)
+                                    if self.redis_client:
+                                        try:
+                                            import json
+                                            dlq_payload = json.dumps({
+                                                "user_id": user_id,
+                                                "repo_id": repo_id,
+                                                "compensating_alpha": -resolved_alpha,
+                                                "error": str(exc)
+                                            })
+                                            self.redis_client.lpush("qdrant_rollback_dlq", dlq_payload)
+                                        except Exception:
+                                            pass
                         raise exc
                 else:
                     conn.rollback()
