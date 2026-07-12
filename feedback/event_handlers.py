@@ -212,8 +212,10 @@ class FeedbackHandler:
             if qdrant_applied_key and self.redis_client:
                 try:
                     qdrant_already_applied = self.redis_client.exists(qdrant_applied_key)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    # Marker Read Failure Replays Delta fix: Fail closed until the marker can be read.
+                    logger.error("Transient Redis error while reading replay marker. Failing closed.")
+                    raise exc
                     
             if state_changed and resolved_alpha != 0.0:
                 if cache_success and db_success:
@@ -236,7 +238,21 @@ class FeedbackHandler:
                             # We failed to write the marker!
                             # We CANNOT proceed to Postgres commit, because if Postgres fails, we can't protect the retry!
                             logger.warning("Rolling back Qdrant vector shift because replay marker could not be written.")
-                            self.update_user_embedding(user_id, repo_id, -resolved_alpha)
+                            rollback_success = self.update_user_embedding(user_id, repo_id, -resolved_alpha)
+                            if not rollback_success:
+                                logger.critical("CRITICAL: Failed to rollback Qdrant after marker write failure!")
+                                if self.redis_client:
+                                    try:
+                                        import json
+                                        dlq_payload = json.dumps({
+                                            "user_id": user_id,
+                                            "repo_id": repo_id,
+                                            "compensating_alpha": -resolved_alpha,
+                                            "error": "marker write failed"
+                                        })
+                                        self.redis_client.lpush("qdrant_rollback_dlq", dlq_payload)
+                                    except Exception:
+                                        pass
                             qdrant_success = False
 
                         if not qdrant_success:
