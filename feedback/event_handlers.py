@@ -111,6 +111,7 @@ class FeedbackHandler:
         action: str,
         *,
         dwell_seconds: Optional[float] = None,
+        message_id: Optional[str] = None,
     ) -> bool:
         """Process a single feedback event: update Postgres counters and shift Qdrant embedding.
 
@@ -204,11 +205,32 @@ class FeedbackHandler:
             # 3. Update Qdrant user embedding vector using the resolved alpha
             # We do this BEFORE Postgres commit so we can compute the correct resolved_alpha.
             qdrant_success = True
+            
+            # Idempotency check for retries
+            qdrant_applied_key = f"qdrant_applied:{message_id}" if message_id else None
+            qdrant_already_applied = False
+            if qdrant_applied_key and self.redis_client:
+                try:
+                    qdrant_already_applied = self.redis_client.exists(qdrant_applied_key)
+                except Exception:
+                    pass
+                    
             if state_changed and resolved_alpha != 0.0:
                 if cache_success:
-                    qdrant_success = self.update_user_embedding(user_id, repo_id, resolved_alpha)
-                    if not qdrant_success:
-                        logger.warning("Failed to adjust Qdrant profile embedding for user '%s'", user_id)
+                    if qdrant_already_applied:
+                        # Qdrant was already updated in a previous attempt. Skip to prevent double shift!
+                        qdrant_success = True
+                        logger.info("Qdrant vector shift already applied for message %s. Skipping.", message_id)
+                    else:
+                        qdrant_success = self.update_user_embedding(user_id, repo_id, resolved_alpha)
+                        if qdrant_success and qdrant_applied_key and self.redis_client:
+                            try:
+                                # Mark as applied so retries don't double shift
+                                self.redis_client.set(qdrant_applied_key, "1", ex=86400 * 7)
+                            except Exception:
+                                pass
+                        if not qdrant_success:
+                            logger.warning("Failed to adjust Qdrant profile embedding for user '%s'", user_id)
                 else:
                     qdrant_success = False
 
@@ -222,6 +244,14 @@ class FeedbackHandler:
                         if state_changed and resolved_alpha != 0.0:
                             logger.error("Postgres commit failed, attempting to rollback Qdrant vector shift...")
                             rollback_success = self.update_user_embedding(user_id, repo_id, -resolved_alpha)
+                            
+                            if rollback_success and qdrant_applied_key and self.redis_client:
+                                try:
+                                    # Rollback succeeded, remove idempotency key so retry re-applies it
+                                    self.redis_client.delete(qdrant_applied_key)
+                                except Exception:
+                                    pass
+                                    
                             if not rollback_success:
                                 logger.critical("CRITICAL: Failed to rollback Qdrant for user '%s'.", user_id)
                                 if self.redis_client:
@@ -236,9 +266,10 @@ class FeedbackHandler:
                                         self.redis_client.lpush("qdrant_rollback_dlq", dlq_payload)
                                     except Exception:
                                         pass
-                                # If rollback fails, we CANNOT retry, otherwise we double-shift Qdrant.
-                                # Acknowledge the event by returning True. The DB row is lost, but ML vector is intact.
-                                return True
+                                # If rollback fails, the idempotency key REMAINS in Redis.
+                                # This means when the event is retried, Qdrant will be skipped!
+                                # So we CAN safely retry, because Qdrant won't double-shift!
+                                # We no longer need to return True and lose the Postgres row!
                         raise exc
                 else:
                     conn.rollback()

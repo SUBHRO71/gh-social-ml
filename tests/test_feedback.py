@@ -560,7 +560,7 @@ async def test_consumer_redis_loop_success():
     
     # Verify handle_feedback was called with new dwell_seconds kwarg (None when not in payload)
     mock_handler.handle_feedback.assert_called_once_with(
-        "u1", "r1", "like", dwell_seconds=None
+        "u1", "r1", "like", dwell_seconds=None, message_id="msg_1"
     )
     # Verify key was set in redis
     mock_redis.set.assert_called_once_with("feedback:processed:msg_1", "1", ex=86400)
@@ -626,7 +626,7 @@ async def test_consumer_redis_loop_retry_ack():
         assert mock_sleep.call_count == 2
         
     mock_handler.handle_feedback.assert_called_once_with(
-        "u1", "r1", "like", dwell_seconds=None
+        "u1", "r1", "like", dwell_seconds=None, message_id="msg_1"
     )
     # Verify set was called
     mock_redis.set.assert_called_once_with("feedback:processed:msg_1", "1", ex=86400)
@@ -884,8 +884,8 @@ def test_postgres_commit_failure_rolls_back_qdrant_vector_shift():
     assert calls[0][0][2] == 0.15
     assert calls[1][0][2] == -0.15
 
-def test_postgres_commit_failure_and_rollback_failure_returns_true():
-    """If Postgres conn.commit() fails and Qdrant rollback fails, it should return True to prevent double-shift on retry."""
+def test_postgres_commit_failure_and_rollback_failure_raises_exception():
+    """If Postgres conn.commit() fails and Qdrant rollback fails, it should raise the exception to retry."""
     handler = _transition_handler()
     handler.store = MagicMock()
     handler.db.enabled = True
@@ -898,9 +898,9 @@ def test_postgres_commit_failure_and_rollback_failure_returns_true():
     # First call succeeds (+0.15), second call (rollback -0.15) fails
     handler.update_user_embedding.side_effect = [True, False]
 
-    # Should NOT raise exception, should return True to ack event
-    res = handler.handle_feedback(USER_UUID, "facebook/react", "like")
-    assert res is True
+    # Should raise exception to retry, since idempotency protects the retry
+    with pytest.raises(Exception, match="commit failed"):
+        handler.handle_feedback(USER_UUID, "facebook/react", "like")
     
     mock_conn.rollback.assert_called()
 

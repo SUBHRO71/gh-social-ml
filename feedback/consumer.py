@@ -81,11 +81,16 @@ class FeedbackConsumer:
                     )
                 except Exception as exc:
                     logger.error("Exception occurred while handling feedback: %s", exc)
-                
                 if not success:
-                    # Retry in-memory events if they fail processing by placing them back
-                    logger.warning("Local queue event failed. Re-queueing.")
-                    await queue.put(event)
+                    # Retry in-memory events with a limit to prevent starving the queue
+                    retries = event.get("retries", 0) + 1
+                    if retries > 3:
+                        logger.error("Local queue event failed permanently after %d retries: %s", retries, event)
+                    else:
+                        event["retries"] = retries
+                        logger.warning("Local queue event failed. Re-queueing. Attempt %d", retries)
+                        await asyncio.sleep(1)
+                        await queue.put(event)
                 
                 queue.task_done()
 
@@ -177,6 +182,7 @@ class FeedbackConsumer:
                                         lambda: self.handler.handle_feedback(
                                             user_id, repo_id, action,
                                             dwell_seconds=dwell_seconds,
+                                            message_id=message_id,
                                         ),
                                     )
                                     
