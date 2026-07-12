@@ -174,14 +174,15 @@ class FeedbackConsumer:
                                         ),
                                     )
                                     
-                                    # Mark as processed in Redis (expires in 24 hours)
-                                    try:
-                                        await loop.run_in_executor(
-                                            None,
-                                            lambda: self.redis_client.set(processed_key, "1", ex=86400)
-                                        )
-                                    except Exception as set_exc:
-                                        logger.warning("Failed to mark message %s as processed in Redis: %s", message_id, set_exc)
+                                    if processed_success:
+                                        # Mark as processed in Redis (expires in 24 hours)
+                                        try:
+                                            await loop.run_in_executor(
+                                                None,
+                                                lambda: self.redis_client.set(processed_key, "1", ex=86400)
+                                            )
+                                        except Exception as set_exc:
+                                            logger.warning("Failed to mark message %s as processed in Redis: %s", message_id, set_exc)
                                 except Exception as exc:
                                     logger.error("Exception handling Redis Stream feedback: %s", exc)
 
