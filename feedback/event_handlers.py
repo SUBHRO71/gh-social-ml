@@ -216,7 +216,7 @@ class FeedbackHandler:
                     pass
                     
             if state_changed and resolved_alpha != 0.0:
-                if cache_success:
+                if cache_success and db_success:
                     if qdrant_already_applied:
                         # Qdrant was already updated in a previous attempt. Skip to prevent double shift!
                         qdrant_success = True

@@ -82,15 +82,18 @@ class FeedbackConsumer:
                 except Exception as exc:
                     logger.error("Exception occurred while handling feedback: %s", exc)
                 if not success:
-                    # Retry in-memory events with a limit to prevent starving the queue
+                    # Retry in-memory events indefinitely with exponential backoff 
+                    # in a background task so we don't starve the queue.
                     retries = event.get("retries", 0) + 1
-                    if retries > 3:
-                        logger.error("Local queue event failed permanently after %d retries: %s", retries, event)
-                    else:
-                        event["retries"] = retries
-                        logger.warning("Local queue event failed. Re-queueing. Attempt %d", retries)
-                        await asyncio.sleep(1)
-                        await queue.put(event)
+                    event["retries"] = retries
+                    logger.warning("Local queue event failed. Re-queueing. Attempt %d", retries)
+                    
+                    async def delayed_requeue(evt, r):
+                        delay = min(60, 2 ** r)
+                        await asyncio.sleep(delay)
+                        await queue.put(evt)
+                        
+                    asyncio.create_task(delayed_requeue(event, retries))
                 
                 queue.task_done()
 
