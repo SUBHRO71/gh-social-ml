@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import math
 import re
@@ -12,6 +12,7 @@ import logging
 from .github_graphql_client import GitHubGraphQLClient
 from utils.readme_processor import ReadmeDocument, process_readme_payload, process_markdown
 from utils.openrouter_client import generate_readme_md
+from .identity import normalize_repository_name, repository_identity_key
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +24,7 @@ class EnrichmentResult:
     readme: ReadmeDocument
     topics: list[str]
     languages: dict[str, int]
+    warnings: list[str] = field(default_factory=list)
 
 
 class RepositoryEnricher:
@@ -30,7 +32,9 @@ class RepositoryEnricher:
         self.graphql_client = graphql_client or GitHubGraphQLClient()
 
     def enrich(self, repository: dict[str, Any] | str) -> EnrichmentResult | None:
-        full_name = repository if isinstance(repository, str) else repository.get("full_name")
+        full_name = normalize_repository_name(
+            repository if isinstance(repository, str) else repository.get("full_name")
+        )
         if not full_name:
             return None
         
@@ -58,14 +62,16 @@ class RepositoryEnricher:
         repo_metadata = {}
         
         for repository in repositories:
-            full_name = repository if isinstance(repository, str) else repository.get("full_name")
+            full_name = normalize_repository_name(
+                repository if isinstance(repository, str) else repository.get("full_name")
+            )
             if not full_name:
                 continue
             owner, _, name = full_name.partition("/")
             if owner and name:
                 targets.append((owner, name))
                 if isinstance(repository, dict):
-                    repo_metadata[full_name] = {
+                    repo_metadata[repository_identity_key(full_name)] = {
                         "_discovery_category": repository.get("_discovery_category"),
                         "_discovery_band": repository.get("_discovery_band")
                     }
@@ -91,15 +97,18 @@ class RepositoryEnricher:
             for full_name, data in batch_res.items():
                 if not data:
                     continue
-                meta = repo_metadata.get(full_name, {})
-                result = self._process_graphql_data(
-                    data,
-                    meta.get("_discovery_category"),
-                    meta.get("_discovery_band"),
-                    readme_text=None,  # fetched in Pass 2
-                )
-                if result:
-                    results.append(result)
+                meta = repo_metadata.get(repository_identity_key(full_name), {})
+                try:
+                    result = self._process_graphql_data(
+                        data,
+                        meta.get("_discovery_category"),
+                        meta.get("_discovery_band"),
+                        readme_text=None,  # fetched in Pass 2
+                    )
+                    if result:
+                        results.append(result)
+                except Exception as exc:
+                    logger.warning("Failed to process metadata for %s: %s", full_name, exc)
 
         # Pass 2: fetch README individually for each result
         owner_name_map = {
@@ -112,7 +121,12 @@ class RepositoryEnricher:
             owner, name = owner_name_map.get(repo_id, (None, None))
             readme_text = ""
             if owner and name:
-                readme_text = self.graphql_client.get_readme(owner, name)
+                try:
+                    readme_text = self.graphql_client.get_readme(owner, name)
+                except Exception as exc:
+                    warning = f"README fetch failed: {type(exc).__name__}: {exc}"
+                    result.warnings.append(warning[:500])
+                    logger.warning("README fetch failed for %s: %s", repo_id, exc)
 
             if readme_text:
                 readme = process_markdown(readme_text)
@@ -143,7 +157,7 @@ class RepositoryEnricher:
         discovery_band: str | None,
         readme_text: str | None = None,
     ) -> EnrichmentResult | None:
-        full_name = data.get("nameWithOwner")
+        full_name = normalize_repository_name(data.get("nameWithOwner"))
         if not full_name:
             return None
 
