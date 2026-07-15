@@ -38,6 +38,7 @@ EMBEDDING_MODEL                 = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2
 EMBEDDING_DIM                   = 384
 COLLECTION_NAME                 = "osiris_research_corpus"
 QDRANT_VECTOR_NAME              = "repo_embedding"
+USER_PROFILES_COLLECTION_NAME   = "user_profiles"
 MAX_DOC_SCORE                   = 100
 GATE_APPROVAL_THRESHOLD         = 0.60
 MIN_STARS_PREFILTER             = 50

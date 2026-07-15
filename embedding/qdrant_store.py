@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import uuid
 from collections.abc import Iterable
 
 from config import (
@@ -16,6 +15,7 @@ from config import (
     REPOSITORY_EMBEDDING_DIM,
 )
 from .repository_embedding import RepositoryEmbeddingResult
+from .vector_contract import repository_point_id
 
 logger = logging.getLogger(__name__)
 
@@ -222,7 +222,7 @@ class QdrantRepositoryStore:
 
     @staticmethod
     def _point_id(repo_id: str) -> str:
-        return str(uuid.uuid5(uuid.NAMESPACE_URL, f"github:{repo_id}"))
+        return repository_point_id(repo_id)
 
     def _distance(self):
         try:
