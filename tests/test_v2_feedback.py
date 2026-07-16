@@ -1,6 +1,10 @@
 import uuid
 from types import SimpleNamespace
 
+import numpy as np
+import pytest
+
+from feedback.event_handlers import ADJUSTMENTS_KEY, LATENT_KEY
 from feedback.v2 import OrderedFeedbackApplier
 
 
@@ -8,21 +12,26 @@ class FakeQdrant:
     def __init__(self, user_id, repo_id, last=0):
         self.user_id = user_id
         self.repo_id = repo_id
-        self.last = last
+        self.user = SimpleNamespace(
+            id=user_id,
+            vector=[1.0, 0.0],
+            payload={"last_feedback_version": last},
+        )
         self.upserts = []
 
     def retrieve(self, collection_name, ids, with_payload, with_vectors):
         if ids[0] == self.user_id:
-            return [SimpleNamespace(id=self.user_id, vector=[1.0, 0.0], payload={"last_feedback_version": self.last})]
+            return [self.user]
         return [SimpleNamespace(id=self.repo_id, vector={"repo_embedding": [0.0, 1.0]}, payload={})]
 
     def upsert(self, **kwargs):
         self.upserts.append(kwargs)
+        self.user = kwargs["points"][0]
 
 
-def event(user_id, repo_id, version):
+def event(user_id, repo_id, version, event_type="like"):
     return {"event_id": str(uuid.uuid4()), "user_id": user_id, "repo_id": repo_id,
-            "feedback_version": str(version), "event_type": "like", "dwell_ms": ""}
+            "feedback_version": str(version), "event_type": event_type, "dwell_ms": ""}
 
 
 def test_feedback_applies_version_with_vector_in_one_upsert():
@@ -42,3 +51,38 @@ def test_feedback_skips_duplicate_and_holds_version_gap():
     assert duplicate.status == "duplicate"
     assert gap.status == "gap"
     assert gap_client.upserts == []
+
+
+@pytest.mark.parametrize(
+    ("forward", "reverse"),
+    [("like", "unlike"), ("dislike", "undislike"), ("save", "unsave")],
+)
+def test_reversal_removes_the_exact_stored_preference(forward, reverse):
+    user_id, repo_id = str(uuid.uuid4()), str(uuid.uuid4())
+    client = FakeQdrant(user_id, repo_id)
+    applier = OrderedFeedbackApplier(client)
+
+    applier.apply(event(user_id, repo_id, 1, forward))
+    assert not np.allclose(client.user.vector, [1.0, 0.0])
+
+    result = applier.apply(event(user_id, repo_id, 2, reverse))
+
+    assert result.status == "applied"
+    assert np.allclose(client.user.vector, [1.0, 0.0])
+    assert np.allclose(client.user.payload[LATENT_KEY], [1.0, 0.0])
+    assert repo_id not in client.user.payload[ADJUSTMENTS_KEY]
+    assert client.user.payload["last_feedback_version"] == 2
+
+
+def test_reversal_preserves_later_unrelated_feedback():
+    user_id, repo_id = str(uuid.uuid4()), str(uuid.uuid4())
+    client = FakeQdrant(user_id, repo_id)
+    applier = OrderedFeedbackApplier(client)
+
+    applier.apply(event(user_id, repo_id, 1, "like"))
+    applier.apply(event(user_id, repo_id, 2, "readme_open"))
+    applier.apply(event(user_id, repo_id, 3, "unlike"))
+
+    expected = np.asarray([1.0, 0.05])
+    expected /= np.linalg.norm(expected)
+    assert np.allclose(client.user.vector, expected)

@@ -6,14 +6,17 @@ import math
 import os
 import socket
 import uuid
+from copy import deepcopy
 from dataclasses import dataclass
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 import numpy as np
 from qdrant_client import QdrantClient
 from qdrant_client.models import PointStruct
 
 from config import QDRANT_API_KEY, QDRANT_COLLECTION_NAME, QDRANT_URL, QDRANT_VECTOR_NAME
+from feedback.event_handlers import ADJUSTMENTS_KEY, LATENT_KEY
+from feedback.interactions import get_interaction
 from scripts.user_onboarding import TARGET_VECTOR_NAME, USER_PROFILES_COLLECTION
 
 logger = logging.getLogger(__name__)
@@ -128,6 +131,35 @@ class OrderedFeedbackApplier:
         dwell = min(300_000, max(3_000, int(event.get("dwell_ms") or 3_000)))
         return 0.15 * math.log1p(dwell) / math.log1p(300_000)
 
+    @staticmethod
+    def _finite_vector(value: Any, dimension: int, *, label: str) -> np.ndarray:
+        vector = np.asarray(value, dtype=np.float64)
+        if vector.ndim != 1 or len(vector) != dimension:
+            raise ValueError(f"{label} must contain exactly {dimension} values")
+        if not np.all(np.isfinite(vector)):
+            raise ValueError(f"{label} contains a non-finite value")
+        return vector
+
+    @staticmethod
+    def _adjustments(payload: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+        value = payload.get(ADJUSTMENTS_KEY, {})
+        if not isinstance(value, Mapping):
+            raise ValueError(f"{ADJUSTMENTS_KEY} must be an object")
+        adjustments = deepcopy(dict(value))
+        for repo_id, repo_state in adjustments.items():
+            if not isinstance(repo_id, str) or not isinstance(repo_state, Mapping):
+                raise ValueError(f"{ADJUSTMENTS_KEY} contains invalid repository state")
+            validated_state: dict[str, Any] = {}
+            for family, stored in repo_state.items():
+                if not isinstance(family, str) or not isinstance(stored, Mapping):
+                    raise ValueError(f"{ADJUSTMENTS_KEY} contains invalid family state")
+                action = stored.get("action")
+                if not isinstance(action, str) or not action:
+                    raise ValueError(f"{ADJUSTMENTS_KEY} contains an invalid action")
+                validated_state[family] = dict(stored)
+            adjustments[repo_id] = validated_state
+        return adjustments
+
     def apply(self, event: dict[str, Any]) -> ApplyResult:
         user_id = str(uuid.UUID(event["user_id"]))
         repo_id = str(uuid.UUID(event["repo_id"]))
@@ -148,24 +180,62 @@ class OrderedFeedbackApplier:
         if version != last + 1:
             return ApplyResult("gap", last)
 
-        repos = self.qdrant.retrieve(
-            collection_name=QDRANT_COLLECTION_NAME,
-            ids=[repo_id],
-            with_payload=False,
-            with_vectors=True,
-        )
-        if not repos:
-            raise LookupError(f"repository vector {repo_id} is not indexed")
         user_vector, user_vector_name = self._vector(user.vector, TARGET_VECTOR_NAME)
-        repo_vector, _ = self._vector(repos[0].vector, QDRANT_VECTOR_NAME)
-        if len(user_vector) != len(repo_vector):
-            raise ValueError("user and repository vector dimensions differ")
-        alpha = self._alpha(event)
-        shifted = np.asarray(user_vector, dtype=np.float64) + alpha * np.asarray(repo_vector, dtype=np.float64)
-        norm = float(np.linalg.norm(shifted))
+        dimension = len(user_vector)
+        current = self._finite_vector(user_vector, dimension, label="user vector")
+        accumulator = self._finite_vector(
+            payload.get(LATENT_KEY, current), dimension, label="feedback latent vector"
+        ).copy()
+        adjustments = self._adjustments(payload)
+        repo_state = adjustments.setdefault(repo_id, {})
+        definition = get_interaction(event["event_type"])
+
+        def repository_vector() -> np.ndarray:
+            repos = self.qdrant.retrieve(
+                collection_name=QDRANT_COLLECTION_NAME,
+                ids=[repo_id],
+                with_payload=False,
+                with_vectors=True,
+            )
+            if not repos:
+                raise LookupError(f"repository vector {repo_id} is not indexed")
+            value, _ = self._vector(repos[0].vector, QDRANT_VECTOR_NAME)
+            return self._finite_vector(value, dimension, label="repository vector")
+
+        if definition.reversal_of:
+            family = definition.state_family or ""
+            stored = repo_state.get(family)
+            if stored and stored.get("action") == definition.reversal_of:
+                accumulator -= self._finite_vector(
+                    stored.get("delta"), dimension, label="stored feedback delta"
+                )
+                repo_state.pop(family, None)
+        elif definition.state_family:
+            family = definition.state_family
+            stored = repo_state.get(family)
+            if not stored or stored.get("action") != event["event_type"]:
+                if stored:
+                    accumulator -= self._finite_vector(
+                        stored.get("delta"), dimension, label="stored feedback delta"
+                    )
+                delta = self._alpha(event) * repository_vector()
+                accumulator += delta
+                repo_state[family] = {
+                    "action": event["event_type"],
+                    "delta": delta.tolist(),
+                    "event_id": event["event_id"],
+                }
+        else:
+            accumulator += self._alpha(event) * repository_vector()
+
+        if not repo_state:
+            adjustments.pop(repo_id, None)
+        norm = float(np.linalg.norm(accumulator))
         if not math.isfinite(norm) or norm == 0:
             raise ValueError("feedback produced an invalid vector")
-        vector = (shifted / norm).tolist()
+        vector = (accumulator / norm).tolist()
+        payload[LATENT_KEY] = accumulator.tolist()
+        payload[ADJUSTMENTS_KEY] = adjustments
         payload["last_feedback_version"] = version
         payload["last_feedback_event_id"] = event["event_id"]
         stored_vector: Any = vector if user_vector_name is None else {user_vector_name: vector}
