@@ -25,4 +25,3 @@ open_multi_agent_readme.md
 
 # uv local artifacts (uv.lock and .python-version remain versioned)
 .uv-cache/
-uv.lock
