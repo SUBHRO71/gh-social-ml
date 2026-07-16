@@ -223,7 +223,8 @@ class RetrievalEngine:
         should include previously served repositories and durable interaction
         exclusions such as explicit dislikes or already-consumed saves. The
         user's Qdrant vector already reflects feedback directionally, so this
-        online path must not query ``FeedbackStore`` and apply it a second time.
+        online path must not query a legacy SQL feedback store and apply it a
+        second time.
         """
         if schema_version != RECOMMENDATION_SCHEMA_VERSION:
             raise ValueError(
@@ -369,9 +370,8 @@ class RetrievalEngine:
         # ── 3. Rank and shape the candidate pool ──────────────────────────────
         start_ranking = time.time()
         ranked = self._rank_candidates(user_vector, user_skills, candidates)
-        # Do not re-query FeedbackStore here: feedback is already represented
-        # in the Qdrant user vector, while exact exclusions are supplied by the
-        # backend in seen_repo_ids.
+        # Feedback is already represented in the Qdrant user vector, while
+        # exact exclusions are supplied by the backend in seen_repo_ids.
         ranked = FeedAssemblySystem().shape_batch(
             ranked,
             seen_repo_ids=seen_repo_ids,
