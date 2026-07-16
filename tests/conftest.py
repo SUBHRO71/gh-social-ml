@@ -27,7 +27,7 @@ def pytest_configure(config):
         "markers", "unit: marks tests as unit tests (fast, no external dependencies)"
     )
     config.addinivalue_line(
-        "markers", "integration: marks tests as integration tests (requires database)"
+        "markers", "integration: marks tests that require external services"
     )
     config.addinivalue_line(
         "markers", "slow: marks tests as slow (network calls, heavy computation)"

@@ -70,7 +70,7 @@ Its OpenAPI documentation is available at `http://127.0.0.1:8000/docs`.
 
 | Method | Path | Purpose | Authentication |
 | --- | --- | --- | --- |
-| `GET` | `/api/v2/health` | ML, Qdrant, and feedback-stream readiness | None |
+| `GET` | `/api/v2/health` | ML, Qdrant, and feedback-stream readiness | `X-Internal-Secret` |
 | `POST` | `/api/v2/recommendations/generate` | Generate canonical `repo_id` recommendations | `X-Internal-Secret` |
 | `POST` | `/api/v2/feedback/batch` | Durably accept ordered interaction feedback | `X-Internal-Secret` |
 | `POST` | `/api/v2/users/onboard` | Create or update a versioned user profile vector | `X-Internal-Secret` |
